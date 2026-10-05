@@ -75,7 +75,7 @@ let pluginRootPath = '';
 let isUiHidden = false;
 let hasActiveVideo = false; // a video is loaded (playing or paused) until stopped
 // Inline (in-pane) playback: decided per session from the terminal
-const INLINE_FRAME = { width: 960, height: 540, fps: 24, file: '/tmp/claude-yt-inline-frame.rgb' };
+const INLINE_FRAME = { width: 1280, height: 720, fps: 24, file: '/tmp/claude-yt-inline-frame.rgb' };
 const INLINE_IMAGE_KEY = 'inline-video';
 const INLINE_CACHE_DIR = '/tmp/claude-yt-inline-cache';
 let modePreference = 'auto'; // 'auto' | 'inline' | 'window'
@@ -582,7 +582,7 @@ export function buildInlineScript(videoId, offsetSeconds, muted, tools = { 'yt-d
   return [
     'exec ' + shellQuote(tools.ffmpeg) + ' -loglevel error',
     '-readrate 1 -readrate_initial_burst ' + burst,
-    '-i <(' + download + ' -f "bv*[height<=720][vcodec^=avc1]/bv*[height<=720]/bv*")',
+    '-i <(' + download + ' -f "bv*[height<=1080][vcodec^=avc1]/bv*[height<=1080]/bv*")',
     '-readrate 1 -readrate_initial_burst ' + burst,
     '-i <(' + download + ' -f "ba[ext=m4a]/ba")',
     '-ss ' + seek + ' -map 0:v:0',
@@ -949,7 +949,11 @@ export function register(on) {
       }
       paneColumns = cols;
       await persistSettings($);
-      if (!isUiHidden) await openPlayerPane($, { focus: false });
+      // An open pane keeps its width: reopen it at the new one
+      if (!isUiHidden) {
+        await $.ui.close({ id: PANE_ID });
+        await openPlayerPane($, { focus: false });
+      }
       $.ui.invalidate('ui.render');
       return { text: 'Pane width set to ' + cols + ' columns.' };
     }
