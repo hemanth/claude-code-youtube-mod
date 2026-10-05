@@ -775,11 +775,13 @@ const YT_HELP = [
   '/yt status'
 ].join('\n');
 
-async function openPlayerPane($) {
+// Opened to watch, the pane leaves the keyboard with the prompt so typing goes
+// on; opened to use (/yt, /yt show, /yt pos), it takes the keys.
+async function openPlayerPane($, { focus = true } = {}) {
   await $.ui.open({
     id: PANE_ID,
     title: 'YouTube Side Player',
-    focus: true,
+    ...(focus ? { focus: true } : {}),
     closeOnEscape: true,
     columns: paneColumns
   });
@@ -877,7 +879,8 @@ export function register(on) {
 
     if (!sub || sub === 'show') {
       isUiHidden = false;
-      await openPlayerPane($);
+      // Bare /yt is to use the pane; /yt show only brings it back into view
+      await openPlayerPane($, { focus: !sub });
       $.ui.invalidate('ui.render');
       return {};
     }
@@ -980,7 +983,7 @@ export function register(on) {
 
     isUiHidden = false;
     // Open first so the inline Image is mounted when frames start arriving
-    await openPlayerPane($);
+    await openPlayerPane($, { focus: false });
     const meta = await playYouTubeTarget($, parts.join(' '), posOverride, sizeOverride);
     $.ui.toast(
       isPlaying

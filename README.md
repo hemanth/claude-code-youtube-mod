@@ -11,6 +11,12 @@ It combines:
    - Borderless, non-activating, always-on-top Picture-in-Picture window (`NSPanel` + `WKWebView`) that stays visible across spaces without stealing keyboard focus from your terminal.
    - Snap to **any of 9 screen positions** (`top-left`, `top-center`, `top-right`, `left-side`, `center`, `right-side`, `bottom-left`, `bottom-center`, `bottom-right`), **full-height left/right side split**, **custom `x,y,w,h` coordinates**, or **drag freely** with your mouse.
 
+## Demo
+
+https://github.com/hemanth/claude-code-youtube-mod/raw/main/demo/demo.mp4
+
+[`demo/demo.mp4`](demo/demo.mp4) (65 s, with sound): Claude Code in Ghostty playing Blender's *Big Buck Bunny* (CC BY 3.0) inline in the side pane, then `/yt status`, `pause`, `resume`, `hide`, `show` and `stop`. Recorded with [`demo/screenrec.swift`](demo/screenrec.swift), a small ScreenCaptureKit recorder that captures a window plus system audio.
+
 ---
 
 ## Quick Start
