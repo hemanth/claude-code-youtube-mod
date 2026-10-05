@@ -1,0 +1,14 @@
+{
+  "name": "claude-code-youtube-mod",
+  "description": "YouTube Side Player: a Claude Code mod for watching YouTube while you code",
+  "owner": {
+    "name": "Hemanth HM"
+  },
+  "plugins": [
+    {
+      "name": "youtube-side-player",
+      "source": "./",
+      "description": "Watch YouTube inline in the Claude Code side pane (Ghostty/kitty) or in a floating macOS window"
+    }
+  ]
+}

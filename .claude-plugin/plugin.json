@@ -1,0 +1,8 @@
+{
+  "name": "youtube-side-player",
+  "version": "0.1.0",
+  "description": "Watch YouTube videos on the side in any screen or terminal position while working in Claude Code",
+  "author": {
+    "name": "Hemanth HM"
+  }
+}

@@ -1,0 +1,4 @@
+{
+  "description": "YouTube Side Player mod for Claude Code — dockable pane, above-prompt mini bar, and multi-position floating PiP player",
+  "modules": ["./register.js"]
+}
