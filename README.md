@@ -15,7 +15,7 @@ It combines:
 
 https://github.com/hemanth/claude-code-youtube-mod/raw/main/demo/demo.mp4
 
-[`demo/demo.mp4`](demo/demo.mp4) (65 s, with sound): Claude Code in Ghostty playing Blender's *Big Buck Bunny* (CC BY 3.0) inline in the side pane, then `/yt status`, `pause`, `resume`, `hide`, `show` and `stop`. Recorded with [`demo/screenrec.swift`](demo/screenrec.swift), a small ScreenCaptureKit recorder that captures a window plus system audio.
+[`demo/demo.mp4`](demo/demo.mp4) (69 s, 1080p, with sound): Claude Code in Ghostty searching `/yt marcus aurelius meditations animated` and playing the top result inline in the side pane, then `/yt status`, `pause`, `resume`, `hide`, `show` and `stop`. Video: *Marcus Aurelius: Meditations (Animated)* by Eudaimonia, shown briefly as a demo; all rights with its creator. Recorded with [`demo/screenrec.swift`](demo/screenrec.swift), a small ScreenCaptureKit recorder that captures a window plus system audio.
 
 ---
 

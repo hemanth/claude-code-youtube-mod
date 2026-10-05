@@ -75,7 +75,7 @@ let pluginRootPath = '';
 let isUiHidden = false;
 let hasActiveVideo = false; // a video is loaded (playing or paused) until stopped
 // Inline (in-pane) playback: decided per session from the terminal
-const INLINE_FRAME = { width: 480, height: 270, fps: 24, file: '/tmp/claude-yt-inline-frame.rgb' };
+const INLINE_FRAME = { width: 960, height: 540, fps: 24, file: '/tmp/claude-yt-inline-frame.rgb' };
 const INLINE_IMAGE_KEY = 'inline-video';
 const INLINE_CACHE_DIR = '/tmp/claude-yt-inline-cache';
 let modePreference = 'auto'; // 'auto' | 'inline' | 'window'
@@ -373,7 +373,13 @@ async function searchYouTubeVideos($, query) {
       let match = regex.exec(res.text);
       while (match && results.length < 6) {
         const id = match[1];
-        const title = match[2];
+        let title = match[2];
+        try {
+          // Titles are JSON string contents: decode \u0026 and friends
+          title = JSON.parse('"' + title + '"');
+        } catch {
+          // Keep it as found
+        }
         if (!seen.has(id)) {
           seen.add(id);
           results.push({ id, title, author: 'YouTube Search' });
@@ -576,11 +582,13 @@ export function buildInlineScript(videoId, offsetSeconds, muted, tools = { 'yt-d
   return [
     'exec ' + shellQuote(tools.ffmpeg) + ' -loglevel error',
     '-readrate 1 -readrate_initial_burst ' + burst,
-    '-i <(' + download + ' -f "bv*[height<=360][vcodec^=avc1]/bv*[height<=360]/bv*")',
+    '-i <(' + download + ' -f "bv*[height<=720][vcodec^=avc1]/bv*[height<=720]/bv*")',
     '-readrate 1 -readrate_initial_burst ' + burst,
     '-i <(' + download + ' -f "ba[ext=m4a]/ba")',
     '-ss ' + seek + ' -map 0:v:0',
-    '-vf scale=' + INLINE_FRAME.width + ':' + INLINE_FRAME.height + ',fps=' + INLINE_FRAME.fps,
+    // Fit inside the frame and letterbox, so 4:3 and vertical videos keep their shape
+    "-vf 'scale=" + INLINE_FRAME.width + ':' + INLINE_FRAME.height + ':force_original_aspect_ratio=decrease,' +
+      'pad=' + INLINE_FRAME.width + ':' + INLINE_FRAME.height + ":(ow-iw)/2:(oh-ih)/2,fps=" + INLINE_FRAME.fps + "'",
     '-pix_fmt rgb24 -c:v rawvideo -f image2 -update 1 -atomic_writing 1 -y ' + INLINE_FRAME.file,
     '-ss ' + seek + ' -map 1:a:0' + (muted ? ' -af volume=0' : '') + ' -f audiotoolbox -'
   ].join(' ');
@@ -771,6 +779,7 @@ const YT_HELP = [
   '/yt hide | show           hide or show the UI; playback keeps going',
   '/yt pos <where> [size]    move the popout window',
   '/yt mode auto|inline|window',
+  '/yt width <cols>          pane width (the inline video scales with it)',
   '/yt setup                 install yt-dlp + ffmpeg for inline video',
   '/yt status'
 ].join('\n');
@@ -810,7 +819,7 @@ export function register(on) {
       await $.command.register({
         name: 'yt',
         description: 'YouTube side player: play, pause, resume, stop, hide, show, pos, mode, status',
-        argumentHint: '[play <url|search> | pause | resume | stop | hide | show | pos <where> | mode auto|inline|window | status]',
+        argumentHint: '[play <url|search> | pause | resume | stop | hide | show | pos <where> | mode auto|inline|window | width <cols> | setup | status]',
         immediate: true
       });
     } catch {
@@ -932,6 +941,17 @@ export function register(on) {
           ']' +
           (playbackMode === 'inline' ? ' (applies to the popout window; inline video lives in the pane)' : '')
       };
+    }
+    if (sub === 'width') {
+      const cols = Number(rest[0]);
+      if (!Number.isInteger(cols) || cols < 30 || cols > 160) {
+        return { text: 'Usage: /yt width <30-160>  (pane width in columns; now ' + paneColumns + ')' };
+      }
+      paneColumns = cols;
+      await persistSettings($);
+      if (!isUiHidden) await openPlayerPane($, { focus: false });
+      $.ui.invalidate('ui.render');
+      return { text: 'Pane width set to ' + cols + ' columns.' };
     }
     if (sub === 'mode') {
       const want = (rest[0] || '').toLowerCase();
