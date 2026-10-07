@@ -738,7 +738,7 @@ async function startInline($, videoId, offsetSeconds, attempt = 0) {
       inlineOffset = 0;
       isPlaying = false;
       certBlockedHint = true;
-      $.ui.toast('YouTube blocked by a TLS certificate error (corporate proxy?). Run /yt setup to allow downloads on this network.');
+      $.ui.toast('TLS cert error (proxy?) — run /yt setup tls off to allow it.');
       $.ui.invalidate('ui.render');
       return;
     }
@@ -912,8 +912,8 @@ const YT_HELP = [
   '/yt pos <where> [size]    move the popout window',
   '/yt mode auto|inline|window',
   '/yt width <cols>          pane width (the inline video scales with it)',
-  '/yt setup                 install deps; probes and configures TLS for this network',
-  '/yt setup tls on|off      set TLS cert verification directly, skipping the probe',
+  '/yt setup                 install deps; probe + set TLS for this network',
+  '/yt setup tls on|off      set TLS verification directly (skip the probe)',
   '/yt status'
 ].join('\n');
 
@@ -942,15 +942,9 @@ function describeMode(includeTls = true) {
   const base =
     'Playback: ' + where + ' (mode ' + modePreference + '; ' + terminalInfo.terminal + ': ' + terminalInfo.reason + ')';
   if (!includeTls) return base;
-  // Durable, pollable view of the TLS choice (re-run /yt setup to change it) --
-  // more reliable than a toast, which can be dropped when fired from a
-  // background callback with no bound session.
-  if (certBlockedHint) {
-    return base + '\nLast play was blocked by a TLS certificate error (corporate proxy?). Run /yt setup to allow downloads on this network.';
-  }
-  return insecureTls
-    ? base + '\nTLS certificate verification: OFF (set by /yt setup for this network). Re-run /yt setup to re-check.'
-    : base;
+  // Durable, pollable TLS status (toasts from the async callback can be dropped).
+  if (certBlockedHint) return base + '\nTLS blocked a download (proxy?) — /yt setup tls off to allow.';
+  return insecureTls ? base + '\nTLS verification: OFF (/yt setup tls on to restore).' : base;
 }
 
 export function register(on) {
@@ -1039,28 +1033,28 @@ export function register(on) {
       return { text: YT_HELP };
     }
     if (sub === 'setup') {
-      const result = await setupInlineDeps($);
-      const manual = (rest[0] || '').toLowerCase() === 'tls';
-      // Configure TLS for this network. Bare `/yt setup` probes (a cert-verified
-      // request) and only disables verification if it actually fails here --
-      // automatic detection, but the user decides by running the command.
-      // `/yt setup tls off|on` sets it directly, skipping the probe, for anyone
-      // who already knows their network's situation.
-      let blocked;
-      if (manual) {
+      // `/yt setup tls on|off` is only a TLS toggle -- it must NOT run the deps
+      // install/probe. Handle it first and return.
+      if ((rest[0] || '').toLowerCase() === 'tls') {
         const want = (rest[1] || '').toLowerCase();
+        let blocked;
         if (want === 'off' || want === 'skip' || want === 'insecure') blocked = true;
         else if (want === 'on' || want === 'secure' || want === 'verify') blocked = false;
         else return { text: 'Usage: /yt setup tls on|off' };
-      } else {
-        blocked = await probeTlsBlocked($);
+        insecureTls = blocked;
+        certBlockedHint = false;
+        await $.store.set('insecureTls', blocked);
+        return { text: 'TLS verification: ' + (blocked ? 'OFF' : 'ON') + ' (set manually).' };
       }
+      // Bare `/yt setup`: install deps, then probe the network and configure
+      // verification from the result (automatic detection, user-initiated).
+      const result = await setupInlineDeps($);
+      const blocked = await probeTlsBlocked($);
       insecureTls = blocked;
       certBlockedHint = false;
       await $.store.set('insecureTls', blocked);
-      const reason = manual ? '(set manually)' : blocked ? '(this network intercepts certificates — corporate proxy?)' : '';
-      const tls = 'TLS certificate verification: ' + (blocked ? 'OFF' : 'ON') + (reason ? ' ' + reason : '') + '.';
-      return { text: (result.ok ? result.message : 'Install failed: ' + result.message) + '\n' + tls + '\n' + describeMode(false) };
+      const tls = 'TLS verification: ' + (blocked ? 'OFF (cert check failed — proxy?)' : 'ON') + '.';
+      return { text: (result.ok ? result.message : 'Install failed: ' + result.message) + '\n' + tls };
     }
     if (sub === 'pause' || sub === 'resume') {
       const wantPlaying = sub === 'resume' || !isPlaying;
