@@ -86,11 +86,15 @@ let inlineOffset = 0;
 let depsDir = ''; // where bin/install-deps.sh puts yt-dlp and ffmpeg
 let depsInstall = null; // the install in flight, if any
 let toolPaths = { 'yt-dlp': 'yt-dlp', ffmpeg: 'ffmpeg' };
-// Flips to true automatically if a download fails TLS cert verification -- i.e.
-// behind a MITM/corporate proxy -- and is then persisted (store 'insecureTls')
-// so later launches skip the failed-then-retry round. Off by default, so
-// verification stays on for everyone else. See the cert-recovery path in startInline.
+// When true, yt-dlp skips TLS cert verification (needed behind a MITM/corporate
+// proxy). Off by default; only the user turns it on, by running `/yt setup`,
+// which probes the network and persists the choice (store 'insecureTls'). A
+// cert-blocked play just points the user at `/yt setup` -- it never flips this.
 let insecureTls = false;
+// Set when a play stops because of a TLS cert error, cleared on a fresh play or
+// after /yt setup. Surfaced in describeMode so the reason is discoverable even
+// if the toast was dropped (toasts from the async callback can be).
+let certBlockedHint = false;
 let lastSurface = null;
 const DEPS_UPDATE_EVERY_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -326,8 +330,8 @@ async function loadSavedSettings($) {
   if (savedMode === 'auto' || savedMode === 'inline' || savedMode === 'window') {
     modePreference = savedMode;
   }
-  // Remembered across restarts: once a cert failure revealed a MITM proxy, skip
-  // the one failed-then-retry round on every later launch.
+  // Remembered across restarts: /yt setup persists the TLS choice for this
+  // network, so later launches don't need to re-probe or re-ask.
   if ((await $.store.get('insecureTls')) === true) {
     insecureTls = true;
   }
@@ -455,6 +459,22 @@ async function resolveTool($, name) {
     }
   }
   return null;
+}
+
+// True if yt-dlp can't verify TLS on this network (a MITM/corporate proxy):
+// a cheap --simulate hits youtube's API over TLS and fails fast with a cert
+// error before touching any media. The video id need not be playable; the
+// handshake fails first. Used by `/yt setup` to configure verification.
+async function probeTlsBlocked($) {
+  try {
+    const { stderr } = await $.process.run([
+      toolPaths['yt-dlp'], '-q', '--no-warnings', '--simulate', '--no-download',
+      'https://www.youtube.com/watch?v=' + (currentVideo.id || 'dQw4w9WgXcQ')
+    ]);
+    return /certificate verif|CERTIFICATE_VERIFY|self-signed certificate/i.test(stderr || '');
+  } catch {
+    return false;
+  }
 }
 
 // Runs bin/install-deps.sh: yt-dlp and ffmpeg into depsDir, checksum-verified.
@@ -687,6 +707,7 @@ export function buildInlineScript(videoId, offsetSeconds, muted, tools = { 'yt-d
 
 async function startInline($, videoId, offsetSeconds, attempt = 0) {
   stopInline();
+  if (attempt === 0) certBlockedHint = false;
   // One script does it all: download (or reuse cache) + warm up + play. The
   // pane shows "Loading…" until the first frame lands, since the frame file
   // isn't written until warmup finishes and ffmpeg starts.
@@ -709,15 +730,16 @@ async function startInline($, videoId, offsetSeconds, attempt = 0) {
     if (inlineSession !== session) return;
     stopInline();
     // A TLS cert failure means a MITM proxy (corporate network): yt-dlp can't
-    // verify the self-signed chain. Auto-recover -- flip to --no-check-certificates,
-    // persist it (so later launches skip this), and retry once. No config needed;
-    // a normal (non-proxied) user never hits this, so verification stays on.
+    // verify the self-signed chain. Don't silently disable verification -- that's
+    // a security decision for the user to make. Stop and point them at `/yt setup`,
+    // which probes and (with their explicit action) configures it.
     const certBlocked = !insecureTls && /certificate verif|CERTIFICATE_VERIFY|self-signed certificate/i.test(stderr);
     if (certBlocked) {
-      insecureTls = true;
-      $.store.set('insecureTls', true).catch(() => {});
-      $.ui.toast('TLS certificate error (corporate proxy?) — retrying without certificate verification.');
-      startInline($, videoId, offsetSeconds, 0).catch(() => {});
+      inlineOffset = 0;
+      isPlaying = false;
+      certBlockedHint = true;
+      $.ui.toast('YouTube blocked by a TLS certificate error (corporate proxy?). Run /yt setup to allow downloads on this network.');
+      $.ui.invalidate('ui.render');
       return;
     }
     // An early death is usually a transient ffmpeg/download hiccup; retry once.
@@ -890,7 +912,7 @@ const YT_HELP = [
   '/yt pos <where> [size]    move the popout window',
   '/yt mode auto|inline|window',
   '/yt width <cols>          pane width (the inline video scales with it)',
-  '/yt setup                 install deps; also re-enables TLS cert verification',
+  '/yt setup                 install deps and configure TLS for this network',
   '/yt status'
 ].join('\n');
 
@@ -916,9 +938,17 @@ async function stopPlayback($) {
 
 function describeMode() {
   const where = playbackMode === 'inline' ? 'inline in the pane' : 'in the popout window';
-  return (
-    'Playback: ' + where + ' (mode ' + modePreference + '; ' + terminalInfo.terminal + ': ' + terminalInfo.reason + ')'
-  );
+  const base =
+    'Playback: ' + where + ' (mode ' + modePreference + '; ' + terminalInfo.terminal + ': ' + terminalInfo.reason + ')';
+  // Durable, pollable view of the TLS choice (re-run /yt setup to change it) --
+  // more reliable than a toast, which can be dropped when fired from a
+  // background callback with no bound session.
+  if (certBlockedHint) {
+    return base + '\nLast play was blocked by a TLS certificate error (corporate proxy?). Run /yt setup to allow downloads on this network.';
+  }
+  return insecureTls
+    ? base + '\nTLS certificate verification: OFF (set by /yt setup for this network). Re-run /yt setup to re-check.'
+    : base;
 }
 
 export function register(on) {
@@ -1007,13 +1037,20 @@ export function register(on) {
       return { text: YT_HELP };
     }
     if (sub === 'setup') {
-      // Re-enable TLS verification: setup is "refresh my environment", and if the
-      // user has since left the proxy this restores security. Still behind one? The
-      // next play's cert failure auto-disables it again.
-      insecureTls = false;
-      await $.store.set('insecureTls', false);
       const result = await setupInlineDeps($);
-      return { text: (result.ok ? result.message : 'Install failed: ' + result.message) + '\n' + describeMode() };
+      // Configure TLS for this network as an explicit, user-initiated step (not
+      // something the plugin decides silently): probe a cert-verified request;
+      // only disable verification if it actually fails here, and re-enable it if
+      // it now works (e.g. the user left the proxy). This is the single knob --
+      // run `/yt setup` whenever the network changes.
+      const blocked = await probeTlsBlocked($);
+      insecureTls = blocked;
+      certBlockedHint = false;
+      await $.store.set('insecureTls', blocked);
+      const tls = blocked
+        ? 'TLS certificate verification: OFF — this network intercepts certificates (corporate proxy), so yt-dlp downloads skip verification.'
+        : 'TLS certificate verification: ON.';
+      return { text: (result.ok ? result.message : 'Install failed: ' + result.message) + '\n' + tls + '\n' + describeMode() };
     }
     if (sub === 'pause' || sub === 'resume') {
       const wantPlaying = sub === 'resume' || !isPlaying;
