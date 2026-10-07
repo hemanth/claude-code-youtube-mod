@@ -508,7 +508,7 @@ async function setupInlineDeps($) {
   $.ui.toast('Installing yt-dlp + ffmpeg for inline video (one-time, ~100 MB)…');
   const result = await installDeps($);
   await detectPlaybackMode($, lastSurface);
-  $.ui.toast(result.ok ? 'Inline video ready: ' + describeMode() : 'Install failed: ' + result.message);
+  $.ui.toast(result.ok ? 'Inline video ready: ' + describeMode(false) : 'Install failed: ' + result.message);
   $.ui.invalidate('ui.render');
   return result;
 }
@@ -936,10 +936,11 @@ async function stopPlayback($) {
   $.ui.invalidate('ui.render');
 }
 
-function describeMode() {
+function describeMode(includeTls = true) {
   const where = playbackMode === 'inline' ? 'inline in the pane' : 'in the popout window';
   const base =
     'Playback: ' + where + ' (mode ' + modePreference + '; ' + terminalInfo.terminal + ': ' + terminalInfo.reason + ')';
+  if (!includeTls) return base;
   // Durable, pollable view of the TLS choice (re-run /yt setup to change it) --
   // more reliable than a toast, which can be dropped when fired from a
   // background callback with no bound session.
@@ -1050,7 +1051,7 @@ export function register(on) {
       const tls = blocked
         ? 'TLS certificate verification: OFF — this network intercepts certificates (corporate proxy), so yt-dlp downloads skip verification.'
         : 'TLS certificate verification: ON.';
-      return { text: (result.ok ? result.message : 'Install failed: ' + result.message) + '\n' + tls + '\n' + describeMode() };
+      return { text: (result.ok ? result.message : 'Install failed: ' + result.message) + '\n' + tls + '\n' + describeMode(false) };
     }
     if (sub === 'pause' || sub === 'resume') {
       const wantPlaying = sub === 'resume' || !isPlaying;
