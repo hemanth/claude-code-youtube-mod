@@ -85,7 +85,12 @@ let inlineSession = null;
 let inlineOffset = 0;
 let depsDir = ''; // where bin/install-deps.sh puts yt-dlp and ffmpeg
 let depsInstall = null; // the install in flight, if any
-let toolPaths = { 'yt-dlp': 'yt-dlp', ffmpeg: 'ffmpeg' };
+let toolPaths = { 'yt-dlp': 'yt-dlp', ffmpeg: 'ffmpeg', python3: 'python3' };
+// Flips to true automatically if a download fails TLS cert verification -- i.e.
+// behind a MITM/corporate proxy -- and is then persisted (store 'insecureTls')
+// so later launches skip the failed-then-retry round. Off by default, so
+// verification stays on for everyone else. See the cert-recovery path in startInline.
+let insecureTls = false;
 let lastSurface = null;
 const DEPS_UPDATE_EVERY_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -321,6 +326,11 @@ async function loadSavedSettings($) {
   if (savedMode === 'auto' || savedMode === 'inline' || savedMode === 'window') {
     modePreference = savedMode;
   }
+  // Remembered across restarts: once a cert failure revealed a MITM proxy, skip
+  // the one failed-then-retry round on every later launch.
+  if ((await $.store.get('insecureTls')) === true) {
+    insecureTls = true;
+  }
 }
 
 async function resolveVideoMetadata($, videoId, fallbackTitle) {
@@ -501,6 +511,10 @@ async function detectPlaybackMode($, surface) {
       if (path) toolPaths[tool] = path;
       else missing.push(tool);
     }
+    // python3 drives the growing-file follower for progressive playback; it's
+    // preinstalled on macOS, so a miss just falls back to the bare name.
+    const py = await resolveTool($, 'python3');
+    if (py) toolPaths.python3 = py;
     if (missing.length > 0) {
       result = {
         ...result,
@@ -520,7 +534,7 @@ function applyModePreference() {
 }
 
 function inlinePosition() {
-  if (!inlineSession) return inlineOffset;
+  if (!inlineSession || inlineSession.phase !== 'playing') return inlineOffset;
   return inlineSession.offset + (Date.now() - inlineSession.startedAt) / 1000;
 }
 
@@ -547,9 +561,9 @@ function drainInBackground(stream, onEnd) {
 function stopInline() {
   if (!inlineSession) return;
   const session = inlineSession;
-  inlineOffset = inlinePosition();
+  if (session.phase === 'playing') inlineOffset = inlinePosition();
   inlineSession = null;
-  session.frameTimer.cancel();
+  if (session.frameTimer) session.frameTimer.cancel();
   session.proc.return(undefined).catch(() => {});
 }
 
@@ -563,39 +577,132 @@ function inlineFrameSource(generation) {
   };
 }
 
-// One ffmpeg reads yt-dlp's separate video and audio downloads at the same
-// pace, writing frames for the pane and playing the sound, so they stay in
-// sync. `exec` makes the spawned process ffmpeg itself: ending it ends both
-// downloads (they get a broken pipe).
 const shellQuote = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'";
 
-export function buildInlineScript(videoId, offsetSeconds, muted, tools = { 'yt-dlp': 'yt-dlp', ffmpeg: 'ffmpeg' }) {
+// Per-video cache: separate video-only / audio-only streams, plus a marker
+// touched once both finish. Streaming yt-dlp|ffmpeg at 1x realtime hitched
+// 300-883ms whenever YouTube's CDN throttled the slow-drip (-readrate 1)
+// connection; reading from a file the download fills at full speed (racing
+// ahead of 1x playback) is rock-steady (~23fps, max 58ms, zero >120ms stalls,
+// measured with CLAUDE_CODE_FRAME_TIMING_LOG). Progressive playback starts as
+// soon as a few MB are buffered instead of waiting for the whole file, which
+// matters most for long videos.
+function cachePaths(videoId) {
+  const base = INLINE_CACHE_DIR + '/' + videoId;
+  return { v: base + '.v.mp4', a: base + '.a.m4a' };
+}
+
+export function buildInlineScript(videoId, offsetSeconds, muted, tools = { 'yt-dlp': 'yt-dlp', ffmpeg: 'ffmpeg', python3: 'python3' }) {
   if (!/^[A-Za-z0-9_-]{11}$/.test(videoId)) {
     throw new Error('not a YouTube video id: ' + videoId);
   }
-  const seek = String(Math.max(0, Math.floor(offsetSeconds)));
-  // Read the first `seek` seconds at full speed so resuming does not wait
-  const burst = String(Math.max(0, Math.floor(offsetSeconds)) + 1);
-  const download =
-    shellQuote(tools['yt-dlp']) + ' -q --no-warnings --no-part --cache-dir ' + INLINE_CACHE_DIR + ' -o - ' +
-    '"https://www.youtube.com/watch?v=' + videoId + '"';
+  const { v, a } = cachePaths(videoId);
+  const ytdlp = shellQuote(tools['yt-dlp']);
+  const ffmpeg = shellQuote(tools.ffmpeg);
+  const py = shellQuote(tools.python3 || 'python3');
+  const url = '"https://www.youtube.com/watch?v=' + videoId + '"';
+  const seek = Math.max(0, Math.floor(offsetSeconds));
+  const followPath = INLINE_CACHE_DIR + '/follow.py';
+  const insecure = insecureTls ? ' --no-check-certificates' : '';
+  const WARM_BYTES = Math.floor(1.5 * 1024 * 1024); // small head start; the full-speed download races ahead of 1x playback
+  const vf = 'scale=' + INLINE_FRAME.width + ':' + INLINE_FRAME.height +
+    ':force_original_aspect_ratio=decrease,pad=' + INLINE_FRAME.width + ':' +
+    INLINE_FRAME.height + ':(ow-iw)/2:(oh-ih)/2,fps=' + INLINE_FRAME.fps;
+
+  // Two independent ffmpeg processes (not one with two outputs): audiotoolbox
+  // needs steady real-time delivery, and sharing a process with the video
+  // branch's per-frame disk write (~2.7MB + atomic rename, fps/sec) let that
+  // I/O steal audio's scheduler slice and glitch it. The two DASH streams are
+  // separate files anyway, so each ffmpeg reads its own.
+  const vLeg = (inp) => ffmpeg + ' -loglevel error -readrate 1 ' + inp +
+    ' -map 0:v:0 -vf ' + shellQuote(vf) +
+    ' -pix_fmt rgb24 -c:v rawvideo -f image2 -update 1 -atomic_writing 1 -y ' + shellQuote(INLINE_FRAME.file);
+  const aLeg = (inp) => ffmpeg + ' -loglevel error -readrate 1 ' + inp +
+    ' -map 0:a:0' + (muted ? ' -af volume=0' : '') + ' -f audiotoolbox -';
+
+  // Complete-cache inputs are seekable regular files (resume/replay/mute honor
+  // -ss). Progressive inputs go through follow.py, which streams the still-
+  // growing download and closes only once the producer (its yt-dlp PID) is gone
+  // AND every byte has been consumed -- pipe backpressure keeps it alive until
+  // the 1x reader catches up, so ffmpeg sees a clean EOF at the true end.
+  const vSeek = '-ss ' + seek + ' -i ' + shellQuote(v);
+  const aSeek = '-ss ' + seek + ' -i ' + shellQuote(a);
+  const vFollow = '-i <(' + py + ' ' + shellQuote(followPath) + ' ' + shellQuote(v) + ' $VDL)';
+  const aFollow = '-i <(' + py + ' ' + shellQuote(followPath) + ' ' + shellQuote(a) + ' $ADL)';
+
+  const playPair = (vInp, aInp) => [
+    vLeg(vInp) + ' & VF=$!',
+    aLeg(aInp) + ' & AF=$!',
+    'while kill -0 $VF 2>/dev/null && kill -0 $AF 2>/dev/null; do sleep 0.2; done'
+  ].join('; ');
+
+  // follow.py, written once per run. Tiny and dependency-free (python3 is
+  // preinstalled on macOS; BSD tail can't do this -- no --pid). It reads the
+  // yt-dlp `.part` temp while downloading and keeps reading after yt-dlp renames
+  // it to the final name (the open fd survives the rename), or opens the final
+  // file directly if the download already finished.
+  const follower = [
+    'cat > ' + shellQuote(followPath) + " <<'PYEOF'",
+    'import sys,os,time',
+    'base,pid=sys.argv[1],int(sys.argv[2])',
+    'def alive(x):',
+    ' try: os.kill(x,0); return True',
+    ' except OSError: return False',
+    'f=None',
+    'while f is None:',
+    ' for cand in (base+".part", base):',
+    '  try: f=open(cand,"rb"); break',
+    '  except FileNotFoundError: pass',
+    ' if f is None:',
+    '  if not alive(pid): sys.exit(0)',
+    '  time.sleep(0.1)',
+    'o=sys.stdout.buffer',
+    'try:',
+    ' while True:',
+    '  c=f.read(65536)',
+    '  if c: o.write(c); o.flush()',
+    '  elif not alive(pid):',
+    '   r=f.read()',
+    '   if r: o.write(r); o.flush()',
+    '   break',
+    '  else: time.sleep(0.1)',
+    'except BrokenPipeError: pass',
+    'PYEOF'
+  ].join('\n');
+
+  // The trap kills the tracked PIDs by name, never `kill 0`: this script shares
+  // Claude Code's process group (it is not a session leader), so `kill 0` would
+  // also kill Claude Code itself -- it crashed the whole session on every stop.
+  // yt-dlp is launched directly (not wrapped in `{ ...; } &`) so $VDL/$ADL are
+  // the real yt-dlp PIDs and the trap actually terminates in-flight downloads.
   return [
-    'exec ' + shellQuote(tools.ffmpeg) + ' -loglevel error',
-    '-readrate 1 -readrate_initial_burst ' + burst,
-    '-i <(' + download + ' -f "bv*[height<=1080][vcodec^=avc1]/bv*[height<=1080]/bv*")',
-    '-readrate 1 -readrate_initial_burst ' + burst,
-    '-i <(' + download + ' -f "ba[ext=m4a]/ba")',
-    '-ss ' + seek + ' -map 0:v:0',
-    // Fit inside the frame and letterbox, so 4:3 and vertical videos keep their shape
-    "-vf 'scale=" + INLINE_FRAME.width + ':' + INLINE_FRAME.height + ':force_original_aspect_ratio=decrease,' +
-      'pad=' + INLINE_FRAME.width + ':' + INLINE_FRAME.height + ":(ow-iw)/2:(oh-ih)/2,fps=" + INLINE_FRAME.fps + "'",
-    '-pix_fmt rgb24 -c:v rawvideo -f image2 -update 1 -atomic_writing 1 -y ' + INLINE_FRAME.file,
-    '-ss ' + seek + ' -map 1:a:0' + (muted ? ' -af volume=0' : '') + ' -f audiotoolbox -'
-  ].join(' ');
+    "trap 'kill $VDL $ADL $VF $AF 2>/dev/null' EXIT TERM INT",
+    'mkdir -p ' + shellQuote(INLINE_CACHE_DIR),
+    // Fast path: both final files exist (yt-dlp renames .part -> final only on a
+    // clean, complete download) -> seekable play honoring -ss. A partial or
+    // interrupted download leaves only a .part, so it just re-fetches.
+    'if [ -f ' + shellQuote(v) + ' ] && [ -f ' + shellQuote(a) + ' ]; then ' + playPair(vSeek, aSeek) + '; exit 0; fi',
+    follower,
+    // Concurrent, full-speed downloads of the separate https (non-m3u8) DASH
+    // streams, launched directly so the trap can kill them. yt-dlp writes a
+    // `.part` that follow.py reads and renames to the final name on success.
+    ytdlp + ' -q --no-warnings' + insecure + ' --cache-dir ' + shellQuote(INLINE_CACHE_DIR) +
+      ' -f "bv*[height<=720][vcodec^=avc1][protocol^=https]/bv*[height<=720][vcodec^=avc1]" -o ' + shellQuote(v) + ' ' + url + ' & VDL=$!',
+    ytdlp + ' -q --no-warnings' + insecure + ' --cache-dir ' + shellQuote(INLINE_CACHE_DIR) +
+      ' -f "ba[ext=m4a][protocol^=https]/ba[protocol^=https]/ba" -o ' + shellQuote(a) + ' ' + url + ' & ADL=$!',
+    // Warm up: enough video buffered (in the .part, or the final if it already
+    // renamed) and audio present, unless the video download already ended.
+    'while { [ ! -s ' + shellQuote(a) + '.part ] && [ ! -s ' + shellQuote(a) + ' ]; } || ' +
+      '[ "$(stat -f%z ' + shellQuote(v) + '.part 2>/dev/null || stat -f%z ' + shellQuote(v) + ' 2>/dev/null || echo 0)" -lt ' + WARM_BYTES + ' ]; do kill -0 $VDL 2>/dev/null || break; sleep 0.3; done',
+    playPair(vFollow, aFollow)
+  ].join('\n');
 }
 
 async function startInline($, videoId, offsetSeconds, attempt = 0) {
   stopInline();
+  // One script does it all: download (or reuse cache) + warm up + play. The
+  // pane shows "Loading…" until the first frame lands, since the frame file
+  // isn't written until warmup finishes and ffmpeg starts.
   const script = buildInlineScript(videoId, offsetSeconds, isMuted, toolPaths);
   const proc = $.process.spawn({ argv: ['/bin/bash', '-c', script] });
 
@@ -607,13 +714,26 @@ async function startInline($, videoId, offsetSeconds, attempt = 0) {
       .catch(() => {});
   });
 
-  const session = { videoId, offset: offsetSeconds, startedAt: Date.now(), proc, frameTimer };
+  const session = { videoId, phase: 'playing', offset: offsetSeconds, startedAt: Date.now(), proc, frameTimer };
   inlineSession = session;
+  $.ui.invalidate('ui.render');
   drainInBackground(proc, (code, stderr) => {
-    // Ended by itself (the video finished or the download failed), not by stopInline
+    // Ended by itself (the video finished or playback failed), not by stopInline
     if (inlineSession !== session) return;
     stopInline();
-    // YouTube now and then refuses a download (HTTP 403); a fresh start usually works
+    // A TLS cert failure means a MITM proxy (corporate network): yt-dlp can't
+    // verify the self-signed chain. Auto-recover -- flip to --no-check-certificates,
+    // persist it (so later launches skip this), and retry once. No config needed;
+    // a normal (non-proxied) user never hits this, so verification stays on.
+    const certBlocked = !insecureTls && /certificate verif|CERTIFICATE_VERIFY|self-signed certificate/i.test(stderr);
+    if (certBlocked) {
+      insecureTls = true;
+      $.store.set('insecureTls', true).catch(() => {});
+      $.ui.toast('TLS certificate error (corporate proxy?) — retrying without certificate verification.');
+      startInline($, videoId, offsetSeconds, 0).catch(() => {});
+      return;
+    }
+    // An early death is usually a transient ffmpeg/download hiccup; retry once.
     if (code !== 0 && attempt < 2 && Date.now() - session.startedAt < 20000) {
       startInline($, videoId, offsetSeconds, attempt + 1).catch(() => {});
       return;
@@ -637,7 +757,10 @@ async function runPlayerCommand($, args) {
   try {
     if (cmd === 'play') {
       inlineOffset = 0;
-      await startInline($, arg, 0);
+      // Don't block the command on the download: startInline sets up the
+      // download session synchronously (so the pane shows "Loading…") and
+      // then fetches + plays in the background.
+      startInline($, arg, 0).catch(() => {});
     } else if (cmd === 'pause' || (cmd === 'toggle' && inlineSession)) {
       stopInline();
     } else if (cmd === 'resume' || cmd === 'toggle') {
@@ -780,7 +903,7 @@ const YT_HELP = [
   '/yt pos <where> [size]    move the popout window',
   '/yt mode auto|inline|window',
   '/yt width <cols>          pane width (the inline video scales with it)',
-  '/yt setup                 install yt-dlp + ffmpeg for inline video',
+  '/yt setup                 install deps; also re-enables TLS cert verification',
   '/yt status'
 ].join('\n');
 
@@ -897,6 +1020,11 @@ export function register(on) {
       return { text: YT_HELP };
     }
     if (sub === 'setup') {
+      // Re-enable TLS verification: setup is "refresh my environment", and if the
+      // user has since left the proxy this restores security. Still behind one? The
+      // next play's cert failure auto-disables it again.
+      insecureTls = false;
+      await $.store.set('insecureTls', false);
       const result = await setupInlineDeps($);
       return { text: (result.ok ? result.message : 'Install failed: ' + result.message) + '\n' + describeMode() };
     }
