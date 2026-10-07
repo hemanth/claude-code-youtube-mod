@@ -278,7 +278,7 @@ test('/yt stop clears the band above the prompt, /yt hide keeps playing', async 
 test('buildInlineScript downloads then plays, seeks on resume, mutes, and refuses anything but a video id', () => {
   const fresh = buildInlineScript('zjkBMFhNj_g', 0, false)
   expect(fresh).toContain('watch?v=zjkBMFhNj_g')
-  expect(fresh).toContain('follow.py')
+  expect(fresh).toContain('follow()')
   expect(fresh).not.toContain('--no-check-certificates')
   expect(fresh).not.toContain('volume=0')
   const resumed = buildInlineScript('zjkBMFhNj_g', 42.7, true)

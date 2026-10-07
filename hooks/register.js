@@ -85,7 +85,7 @@ let inlineSession = null;
 let inlineOffset = 0;
 let depsDir = ''; // where bin/install-deps.sh puts yt-dlp and ffmpeg
 let depsInstall = null; // the install in flight, if any
-let toolPaths = { 'yt-dlp': 'yt-dlp', ffmpeg: 'ffmpeg', python3: 'python3' };
+let toolPaths = { 'yt-dlp': 'yt-dlp', ffmpeg: 'ffmpeg' };
 // Flips to true automatically if a download fails TLS cert verification -- i.e.
 // behind a MITM/corporate proxy -- and is then persisted (store 'insecureTls')
 // so later launches skip the failed-then-retry round. Off by default, so
@@ -511,10 +511,6 @@ async function detectPlaybackMode($, surface) {
       if (path) toolPaths[tool] = path;
       else missing.push(tool);
     }
-    // python3 drives the growing-file follower for progressive playback; it's
-    // preinstalled on macOS, so a miss just falls back to the bare name.
-    const py = await resolveTool($, 'python3');
-    if (py) toolPaths.python3 = py;
     if (missing.length > 0) {
       result = {
         ...result,
@@ -592,17 +588,15 @@ function cachePaths(videoId) {
   return { v: base + '.v.mp4', a: base + '.a.m4a' };
 }
 
-export function buildInlineScript(videoId, offsetSeconds, muted, tools = { 'yt-dlp': 'yt-dlp', ffmpeg: 'ffmpeg', python3: 'python3' }) {
+export function buildInlineScript(videoId, offsetSeconds, muted, tools = { 'yt-dlp': 'yt-dlp', ffmpeg: 'ffmpeg' }) {
   if (!/^[A-Za-z0-9_-]{11}$/.test(videoId)) {
     throw new Error('not a YouTube video id: ' + videoId);
   }
   const { v, a } = cachePaths(videoId);
   const ytdlp = shellQuote(tools['yt-dlp']);
   const ffmpeg = shellQuote(tools.ffmpeg);
-  const py = shellQuote(tools.python3 || 'python3');
   const url = '"https://www.youtube.com/watch?v=' + videoId + '"';
   const seek = Math.max(0, Math.floor(offsetSeconds));
-  const followPath = INLINE_CACHE_DIR + '/follow.py';
   const insecure = insecureTls ? ' --no-check-certificates' : '';
   const WARM_BYTES = Math.floor(1.5 * 1024 * 1024); // small head start; the full-speed download races ahead of 1x playback
   const vf = 'scale=' + INLINE_FRAME.width + ':' + INLINE_FRAME.height +
@@ -621,14 +615,16 @@ export function buildInlineScript(videoId, offsetSeconds, muted, tools = { 'yt-d
     ' -map 0:a:0' + (muted ? ' -af volume=0' : '') + ' -f audiotoolbox -';
 
   // Complete-cache inputs are seekable regular files (resume/replay/mute honor
-  // -ss). Progressive inputs go through follow.py, which streams the still-
-  // growing download and closes only once the producer (its yt-dlp PID) is gone
-  // AND every byte has been consumed -- pipe backpressure keeps it alive until
-  // the 1x reader catches up, so ffmpeg sees a clean EOF at the true end.
+  // -ss). Progressive inputs go through a `follow` shell function that streams
+  // the still-growing download and closes only once the producer (its yt-dlp
+  // PID) is gone AND every byte has been consumed -- pipe backpressure keeps it
+  // alive until the 1x reader catches up, so ffmpeg sees a clean EOF at the true
+  // end. (ffmpeg reading the growing file directly instead hits a premature EOF
+  // the moment playback touches the download front.)
   const vSeek = '-ss ' + seek + ' -i ' + shellQuote(v);
   const aSeek = '-ss ' + seek + ' -i ' + shellQuote(a);
-  const vFollow = '-i <(' + py + ' ' + shellQuote(followPath) + ' ' + shellQuote(v) + ' $VDL)';
-  const aFollow = '-i <(' + py + ' ' + shellQuote(followPath) + ' ' + shellQuote(a) + ' $ADL)';
+  const vFollow = '-i <(follow ' + shellQuote(v) + ' $VDL)';
+  const aFollow = '-i <(follow ' + shellQuote(a) + ' $ADL)';
 
   const playPair = (vInp, aInp) => [
     vLeg(vInp) + ' & VF=$!',
@@ -636,38 +632,29 @@ export function buildInlineScript(videoId, offsetSeconds, muted, tools = { 'yt-d
     'while kill -0 $VF 2>/dev/null && kill -0 $AF 2>/dev/null; do sleep 0.2; done'
   ].join('; ');
 
-  // follow.py, written once per run. Tiny and dependency-free (python3 is
-  // preinstalled on macOS; BSD tail can't do this -- no --pid). It reads the
-  // yt-dlp `.part` temp while downloading and keeps reading after yt-dlp renames
-  // it to the final name (the open fd survives the rename), or opens the final
-  // file directly if the download already finished.
+  // Pure-shell follower (no python/coreutils -- tail/head/stat are built in;
+  // BSD tail alone can't, it has no --pid). Emits the [off,end) slice each pass
+  // and blocks on the pipe when the 1x reader is behind, so it self-paces and
+  // closes at the true end once the producer PID is gone and all bytes are out.
+  // Reads the yt-dlp `.part` while downloading and the renamed final file after
+  // (byte-identical, so the running offset carries across the rename).
   const follower = [
-    'cat > ' + shellQuote(followPath) + " <<'PYEOF'",
-    'import sys,os,time',
-    'base,pid=sys.argv[1],int(sys.argv[2])',
-    'def alive(x):',
-    ' try: os.kill(x,0); return True',
-    ' except OSError: return False',
-    'f=None',
-    'while f is None:',
-    ' for cand in (base+".part", base):',
-    '  try: f=open(cand,"rb"); break',
-    '  except FileNotFoundError: pass',
-    ' if f is None:',
-    '  if not alive(pid): sys.exit(0)',
-    '  time.sleep(0.1)',
-    'o=sys.stdout.buffer',
-    'try:',
-    ' while True:',
-    '  c=f.read(65536)',
-    '  if c: o.write(c); o.flush()',
-    '  elif not alive(pid):',
-    '   r=f.read()',
-    '   if r: o.write(r); o.flush()',
-    '   break',
-    '  else: time.sleep(0.1)',
-    'except BrokenPipeError: pass',
-    'PYEOF'
+    'follow() {',
+    '  base="$1"; prod="$2"; off=0',
+    '  while :; do',
+    '    if [ -e "$base.part" ]; then src="$base.part"; else src="$base"; fi',
+    '    end=$(stat -f%z "$src" 2>/dev/null || echo 0)',
+    '    if [ "$end" -gt "$off" ]; then',
+    '      tail -c +$((off+1)) "$src" 2>/dev/null | head -c $((end-off)); off="$end"',
+    '    elif kill -0 "$prod" 2>/dev/null; then sleep 0.2',
+    '    else',
+    '      if [ -e "$base.part" ]; then src="$base.part"; else src="$base"; fi',
+    '      end=$(stat -f%z "$src" 2>/dev/null || echo "$off")',
+    '      [ "$end" -gt "$off" ] && tail -c +$((off+1)) "$src" 2>/dev/null | head -c $((end-off))',
+    '      break',
+    '    fi',
+    '  done',
+    '}'
   ].join('\n');
 
   // The trap kills the tracked PIDs by name, never `kill 0`: this script shares
@@ -685,7 +672,7 @@ export function buildInlineScript(videoId, offsetSeconds, muted, tools = { 'yt-d
     follower,
     // Concurrent, full-speed downloads of the separate https (non-m3u8) DASH
     // streams, launched directly so the trap can kill them. yt-dlp writes a
-    // `.part` that follow.py reads and renames to the final name on success.
+    // `.part` that the follower reads and renames to the final name on success.
     ytdlp + ' -q --no-warnings' + insecure + ' --cache-dir ' + shellQuote(INLINE_CACHE_DIR) +
       ' -f "bv*[height<=720][vcodec^=avc1][protocol^=https]/bv*[height<=720][vcodec^=avc1]" -o ' + shellQuote(v) + ' ' + url + ' & VDL=$!',
     ytdlp + ' -q --no-warnings' + insecure + ' --cache-dir ' + shellQuote(INLINE_CACHE_DIR) +
