@@ -757,10 +757,10 @@ async function runPlayerCommand($, args) {
   try {
     if (cmd === 'play') {
       inlineOffset = 0;
-      // Don't block the command on the download: startInline sets up the
-      // download session synchronously (so the pane shows "Loading…") and
-      // then fetches + plays in the background.
-      startInline($, arg, 0).catch(() => {});
+      // startInline returns once the player process is spawned; the download and
+      // warmup happen inside that process (drained in the background), so this
+      // does not block on the download. The pane shows "Loading…" until frames land.
+      await startInline($, arg, 0);
     } else if (cmd === 'pause' || (cmd === 'toggle' && inlineSession)) {
       stopInline();
     } else if (cmd === 'resume' || cmd === 'toggle') {

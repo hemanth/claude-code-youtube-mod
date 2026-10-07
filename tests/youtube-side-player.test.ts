@@ -275,13 +275,14 @@ test('/yt stop clears the band above the prompt, /yt hide keeps playing', async 
   await band.unmount()
 })
 
-test('buildInlineScript seeks on resume, mutes, and refuses anything but a video id', () => {
+test('buildInlineScript downloads then plays, seeks on resume, mutes, and refuses anything but a video id', () => {
   const fresh = buildInlineScript('zjkBMFhNj_g', 0, false)
-  expect(fresh).toContain('-readrate_initial_burst 1 ')
+  expect(fresh).toContain('watch?v=zjkBMFhNj_g')
+  expect(fresh).toContain('follow.py')
+  expect(fresh).not.toContain('--no-check-certificates')
   expect(fresh).not.toContain('volume=0')
   const resumed = buildInlineScript('zjkBMFhNj_g', 42.7, true)
   expect(resumed).toContain('-ss 42 ')
-  expect(resumed).toContain('-readrate_initial_burst 43 ')
   expect(resumed).toContain('-af volume=0')
   expect(() => buildInlineScript('"; rm -rf ~; "', 0, false)).toThrow()
 })
@@ -309,7 +310,7 @@ test('in Ghostty without yt-dlp/ffmpeg, the first play installs them and then pl
   expect(installed).toBe(true)
   const inline = processCalls.find((argv) => argv[0] === '/bin/bash' && argv[1] === '-c')
   expect(inline?.[2]).toContain("'/Users/someone/.claude/plugins/data/youtube-side-player/bin/yt-dlp'")
-  expect(inline?.[2]).toContain("exec '/Users/someone/.claude/plugins/data/youtube-side-player/bin/ffmpeg'")
+  expect(inline?.[2]).toContain("'/Users/someone/.claude/plugins/data/youtube-side-player/bin/ffmpeg' -loglevel error")
   expect(toasts.some((t) => t.startsWith('Inline video ready'))).toBe(true)
   expect(processCalls.some((argv) => argv[0].endsWith('/yt-pip'))).toBe(false)
 })
