@@ -912,7 +912,8 @@ const YT_HELP = [
   '/yt pos <where> [size]    move the popout window',
   '/yt mode auto|inline|window',
   '/yt width <cols>          pane width (the inline video scales with it)',
-  '/yt setup                 install deps and configure TLS for this network',
+  '/yt setup                 install deps; probes and configures TLS for this network',
+  '/yt setup tls on|off      set TLS cert verification directly, skipping the probe',
   '/yt status'
 ].join('\n');
 
@@ -960,7 +961,7 @@ export function register(on) {
       await $.command.register({
         name: 'yt',
         description: 'YouTube side player: play, pause, resume, stop, hide, show, pos, mode, status',
-        argumentHint: '[play <url|search> | pause | resume | stop | hide | show | pos <where> | mode auto|inline|window | width <cols> | setup | status]',
+        argumentHint: '[play <url|search> | pause | resume | stop | hide | show | pos <where> | mode auto|inline|window | width <cols> | setup [tls on|off] | status]',
         immediate: true
       });
     } catch {
@@ -1039,18 +1040,26 @@ export function register(on) {
     }
     if (sub === 'setup') {
       const result = await setupInlineDeps($);
-      // Configure TLS for this network as an explicit, user-initiated step (not
-      // something the plugin decides silently): probe a cert-verified request;
-      // only disable verification if it actually fails here, and re-enable it if
-      // it now works (e.g. the user left the proxy). This is the single knob --
-      // run `/yt setup` whenever the network changes.
-      const blocked = await probeTlsBlocked($);
+      const manual = (rest[0] || '').toLowerCase() === 'tls';
+      // Configure TLS for this network. Bare `/yt setup` probes (a cert-verified
+      // request) and only disables verification if it actually fails here --
+      // automatic detection, but the user decides by running the command.
+      // `/yt setup tls off|on` sets it directly, skipping the probe, for anyone
+      // who already knows their network's situation.
+      let blocked;
+      if (manual) {
+        const want = (rest[1] || '').toLowerCase();
+        if (want === 'off' || want === 'skip' || want === 'insecure') blocked = true;
+        else if (want === 'on' || want === 'secure' || want === 'verify') blocked = false;
+        else return { text: 'Usage: /yt setup tls on|off' };
+      } else {
+        blocked = await probeTlsBlocked($);
+      }
       insecureTls = blocked;
       certBlockedHint = false;
       await $.store.set('insecureTls', blocked);
-      const tls = blocked
-        ? 'TLS certificate verification: OFF — this network intercepts certificates (corporate proxy), so yt-dlp downloads skip verification.'
-        : 'TLS certificate verification: ON.';
+      const reason = manual ? '(set manually)' : blocked ? '(this network intercepts certificates — corporate proxy?)' : '';
+      const tls = 'TLS certificate verification: ' + (blocked ? 'OFF' : 'ON') + (reason ? ' ' + reason : '') + '.';
       return { text: (result.ok ? result.message : 'Install failed: ' + result.message) + '\n' + tls + '\n' + describeMode(false) };
     }
     if (sub === 'pause' || sub === 'resume') {
